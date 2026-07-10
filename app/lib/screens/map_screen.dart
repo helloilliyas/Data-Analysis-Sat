@@ -6,7 +6,9 @@ import '../config.dart';
 import '../db/database.dart';
 import '../services/geocoding_service.dart';
 import '../services/location_service.dart';
+import '../services/processing_service.dart';
 import '../utils/geo.dart';
+import '../widgets/server_settings_dialog.dart';
 
 enum _EditMode { add, move, delete }
 
@@ -33,6 +35,9 @@ class _MapScreenState extends State<MapScreen> {
   _EditMode _mode = _EditMode.add;
   int? _selectedVertex;
   bool _locating = false;
+  ImageryOverlay? _overlay;
+  double _overlayOpacity = 1;
+  bool _loadingImagery = false;
 
   static const _initialCenter = LatLng(20.0, 0.0);
   static const _initialZoom = 2.5;
@@ -119,6 +124,45 @@ class _MapScreenState extends State<MapScreen> {
     }
   }
 
+  Future<void> _openImagery() async {
+    if (_vertices.length < 3) {
+      _showMessage('Draw an area first (at least 3 points).');
+      return;
+    }
+    var config = await loadProcessingConfig(widget.db);
+    if (!config.isConfigured) {
+      if (!mounted) return;
+      config = await showServerSettingsDialog(context, widget.db) ??
+          const ProcessingConfig(baseUrl: '', apiKey: '');
+      if (!config.isConfigured) return;
+    }
+    if (!mounted) return;
+
+    final service = ProcessingService(config);
+    final polygonGeoJson = polygonToGeoJson(_vertices);
+    final scene = await showModalBottomSheet<SceneInfo>(
+      context: context,
+      isScrollControlled: true,
+      builder: (context) =>
+          _ImagerySheet(service: service, polygonGeoJson: polygonGeoJson),
+    );
+    if (scene == null || !mounted) return;
+
+    setState(() => _loadingImagery = true);
+    try {
+      final overlay = await service.fetchTruecolor(
+        polygonGeoJson: polygonGeoJson,
+        sceneId: scene.id,
+      );
+      if (!mounted) return;
+      setState(() => _overlay = overlay);
+    } on ProcessingException catch (e) {
+      _showMessage(e.message);
+    } finally {
+      if (mounted) setState(() => _loadingImagery = false);
+    }
+  }
+
   Future<void> _openSearch() async {
     final result = await showDialog<PlaceResult>(
       context: context,
@@ -186,6 +230,17 @@ class _MapScreenState extends State<MapScreen> {
             tooltip: 'Search location',
             onPressed: _openSearch,
           ),
+          IconButton(
+            icon: _loadingImagery
+                ? const SizedBox(
+                    width: 18,
+                    height: 18,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  )
+                : const Icon(Icons.satellite_alt),
+            tooltip: 'Satellite imagery',
+            onPressed: _loadingImagery ? null : _openImagery,
+          ),
         ],
       ),
       body: Stack(
@@ -204,6 +259,16 @@ class _MapScreenState extends State<MapScreen> {
                 urlTemplate: MapConfig.tileUrl,
                 userAgentPackageName: MapConfig.userAgentPackageName,
               ),
+              if (_overlay != null)
+                Opacity(
+                  opacity: _overlayOpacity,
+                  child: OverlayImageLayer(overlayImages: [
+                    OverlayImage(
+                      bounds: _overlay!.bounds,
+                      imageProvider: MemoryImage(_overlay!.imageBytes),
+                    ),
+                  ]),
+                ),
               if (_vertices.length >= 3)
                 PolygonLayer(polygons: [
                   Polygon(
@@ -246,21 +311,34 @@ class _MapScreenState extends State<MapScreen> {
             left: 8,
             right: 8,
             bottom: 8,
-            child: _EditPanel(
-              mode: _mode,
-              onModeChanged: (m) => setState(() {
-                _mode = m;
-                _selectedVertex = null;
-              }),
-              areaLabel: _vertices.length >= 3
-                  ? '${formatArea(_areaSqMeters)}${_overCap ? '  (over ${kMaxAreaSqKm.toStringAsFixed(0)} km² limit)' : ''}'
-                  : 'Tap the map to add points',
-              overCap: _overCap,
-              canUndo: _history.isNotEmpty,
-              hasVertices: _vertices.isNotEmpty,
-              moveHint: _mode == _EditMode.move && _selectedVertex != null,
-              onUndo: _undo,
-              onClear: _clear,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                if (_overlay != null)
+                  _OverlayControlCard(
+                    overlay: _overlay!,
+                    opacity: _overlayOpacity,
+                    onOpacityChanged: (v) =>
+                        setState(() => _overlayOpacity = v),
+                    onClose: () => setState(() => _overlay = null),
+                  ),
+                _EditPanel(
+                  mode: _mode,
+                  onModeChanged: (m) => setState(() {
+                    _mode = m;
+                    _selectedVertex = null;
+                  }),
+                  areaLabel: _vertices.length >= 3
+                      ? '${formatArea(_areaSqMeters)}${_overCap ? '  (over ${kMaxAreaSqKm.toStringAsFixed(0)} km² limit)' : ''}'
+                      : 'Tap the map to add points',
+                  overCap: _overCap,
+                  canUndo: _history.isNotEmpty,
+                  hasVertices: _vertices.isNotEmpty,
+                  moveHint: _mode == _EditMode.move && _selectedVertex != null,
+                  onUndo: _undo,
+                  onClear: _clear,
+                ),
+              ],
             ),
           ),
         ],
@@ -402,6 +480,194 @@ class _EditPanel extends StatelessWidget {
               selected: {mode},
               onSelectionChanged: (s) => onModeChanged(s.first),
             ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _OverlayControlCard extends StatelessWidget {
+  const _OverlayControlCard({
+    required this.overlay,
+    required this.opacity,
+    required this.onOpacityChanged,
+    required this.onClose,
+  });
+
+  final ImageryOverlay overlay;
+  final double opacity;
+  final ValueChanged<double> onOpacityChanged;
+  final VoidCallback onClose;
+
+  @override
+  Widget build(BuildContext context) {
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+        child: Row(
+          children: [
+            const Icon(Icons.satellite_alt, size: 18),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(
+                '${overlay.scene.dateLabel} · '
+                '${overlay.scene.cloudPct.toStringAsFixed(0)}% cloud',
+                style: const TextStyle(fontSize: 13),
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+            SizedBox(
+              width: 110,
+              child: Slider(
+                value: opacity,
+                onChanged: onOpacityChanged,
+              ),
+            ),
+            IconButton(
+              icon: const Icon(Icons.close),
+              tooltip: 'Remove imagery',
+              onPressed: onClose,
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// Bottom sheet listing available Sentinel-2 scenes for the drawn area.
+/// Pops with the selected [SceneInfo].
+class _ImagerySheet extends StatefulWidget {
+  const _ImagerySheet({required this.service, required this.polygonGeoJson});
+
+  final ProcessingService service;
+  final String polygonGeoJson;
+
+  @override
+  State<_ImagerySheet> createState() => _ImagerySheetState();
+}
+
+class _ImagerySheetState extends State<_ImagerySheet> {
+  late DateTimeRange _range;
+  List<SceneInfo>? _scenes;
+  String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    final now = DateTime.now();
+    _range = DateTimeRange(start: now.subtract(const Duration(days: 90)), end: now);
+    _load();
+  }
+
+  Future<void> _load() async {
+    setState(() {
+      _scenes = null;
+      _error = null;
+    });
+    try {
+      final scenes = await widget.service.fetchScenes(
+        polygonGeoJson: widget.polygonGeoJson,
+        start: _range.start,
+        end: _range.end,
+      );
+      if (!mounted) return;
+      setState(() => _scenes = scenes);
+    } on ProcessingException catch (e) {
+      if (!mounted) return;
+      setState(() => _error = e.message);
+    }
+  }
+
+  Future<void> _pickRange() async {
+    final picked = await showDateRangePicker(
+      context: context,
+      firstDate: DateTime(2017), // Sentinel-2 L2A archive start
+      lastDate: DateTime.now(),
+      initialDateRange: _range,
+    );
+    if (picked != null) {
+      setState(() => _range = picked);
+      await _load();
+    }
+  }
+
+  String _fmt(DateTime d) =>
+      '${d.year}-${d.month.toString().padLeft(2, '0')}-'
+      '${d.day.toString().padLeft(2, '0')}';
+
+  @override
+  Widget build(BuildContext context) {
+    final scenes = _scenes;
+    return SafeArea(
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                const Expanded(
+                  child: Text('Satellite imagery',
+                      style: TextStyle(
+                          fontSize: 16, fontWeight: FontWeight.bold)),
+                ),
+                TextButton.icon(
+                  icon: const Icon(Icons.date_range, size: 18),
+                  label: Text('${_fmt(_range.start)} → ${_fmt(_range.end)}'),
+                  onPressed: _pickRange,
+                ),
+              ],
+            ),
+            const Text(
+              'Cloud % is for the whole scene — your area may differ.',
+              style: TextStyle(fontSize: 12, color: Colors.grey),
+            ),
+            const SizedBox(height: 8),
+            if (_error != null)
+              Padding(
+                padding: const EdgeInsets.all(16),
+                child: Text(_error!,
+                    style:
+                        TextStyle(color: Theme.of(context).colorScheme.error)),
+              )
+            else if (scenes == null)
+              const Center(
+                  child: Padding(
+                padding: EdgeInsets.all(24),
+                child: CircularProgressIndicator(),
+              ))
+            else if (scenes.isEmpty)
+              const Padding(
+                padding: EdgeInsets.all(16),
+                child: Text('No scenes found for this range.'),
+              )
+            else
+              Flexible(
+                child: ListView.builder(
+                  shrinkWrap: true,
+                  itemCount: scenes.length,
+                  itemBuilder: (context, i) {
+                    final scene = scenes[i];
+                    final cloudy = scene.cloudPct > 40;
+                    return ListTile(
+                      dense: true,
+                      leading: Icon(
+                        cloudy ? Icons.cloud : Icons.wb_sunny,
+                        color: cloudy ? Colors.grey : Colors.orange,
+                      ),
+                      title: Text(scene.dateLabel),
+                      subtitle: Text(
+                          '${scene.cloudPct.toStringAsFixed(0)}% cloud · ${scene.id}',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis),
+                      onTap: () => Navigator.of(context).pop(scene),
+                    );
+                  },
+                ),
+              ),
           ],
         ),
       ),

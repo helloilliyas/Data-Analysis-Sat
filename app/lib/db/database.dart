@@ -17,7 +17,16 @@ class Projects extends Table {
   DateTimeColumn get updatedAt => dateTime().withDefault(currentDateAndTime)();
 }
 
-@DriftDatabase(tables: [Projects])
+/// Simple key/value store for app settings (processing server URL, API key).
+class Settings extends Table {
+  TextColumn get key => text()();
+  TextColumn get value => text()();
+
+  @override
+  Set<Column> get primaryKey => {key};
+}
+
+@DriftDatabase(tables: [Projects, Settings])
 class AppDatabase extends _$AppDatabase {
   AppDatabase() : super(driftDatabase(name: 'satellite_app'));
 
@@ -60,4 +69,14 @@ class AppDatabase extends _$AppDatabase {
 
   Future<int> deleteProject(int id) =>
       (delete(projects)..where((t) => t.id.equals(id))).go();
+
+  Future<String?> getSetting(String key) async {
+    final row = await (select(settings)..where((t) => t.key.equals(key)))
+        .getSingleOrNull();
+    return row?.value;
+  }
+
+  Future<void> setSetting(String key, String value) =>
+      into(settings).insertOnConflictUpdate(
+          SettingsCompanion.insert(key: key, value: value));
 }

@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../db/database.dart';
 import '../utils/geo.dart';
+import '../widgets/server_settings_dialog.dart';
 import 'map_screen.dart';
 
 /// Project list. Each project is a saved land area; Phase 2 adds imagery and
@@ -14,7 +15,16 @@ class HomeScreen extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('Satellite Land Analysis')),
+      appBar: AppBar(
+        title: const Text('Satellite Land Analysis'),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.settings),
+            tooltip: 'Processing server settings',
+            onPressed: () => showServerSettingsDialog(context, db),
+          ),
+        ],
+      ),
       body: StreamBuilder<List<Project>>(
         stream: db.watchProjects(),
         builder: (context, snapshot) {
