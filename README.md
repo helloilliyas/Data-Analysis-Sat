@@ -59,6 +59,12 @@ Phase 2 — done
 - [x] Server settings screen (URL + API key, stored locally)
 - [x] CI: tests + APK artifact on every push
 
-Phase 3 — next
-- [ ] NDVI with SCL cloud masking and BOA offset handling
-- [ ] Before/after comparison + ΔNDVI
+Phase 3 — done
+- [x] NDVI with SCL cloud masking and BOA offset handling, colour ramp,
+      per-area stats, analysis-grade 16-bit values
+- [x] Before/after comparison: ΔNDVI on a shared pixel grid
+- [x] OSM paths & trails overlay (Overpass API), coloured by type
+
+Phase 4 — next
+- [ ] Persist analyses per project (files + results.json)
+- [ ] Export/restore project ZIPs, PDF reports, storage controls

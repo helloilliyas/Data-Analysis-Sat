@@ -40,6 +40,31 @@ class SceneInfo {
   }
 }
 
+/// Summary statistics returned with NDVI / ΔNDVI results.
+class SceneStats {
+  const SceneStats({
+    required this.mean,
+    required this.min,
+    required this.max,
+    required this.validPixelPct,
+    required this.aoiCloudPct,
+  });
+
+  factory SceneStats.fromJson(Map<String, dynamic> json) => SceneStats(
+        mean: (json['mean'] as num?)?.toDouble(),
+        min: (json['min'] as num?)?.toDouble(),
+        max: (json['max'] as num?)?.toDouble(),
+        validPixelPct: (json['valid_pixel_pct'] as num?)?.toDouble() ?? 0,
+        aoiCloudPct: (json['aoi_cloud_pct'] as num?)?.toDouble() ?? 0,
+      );
+
+  final double? mean;
+  final double? min;
+  final double? max;
+  final double validPixelPct;
+  final double aoiCloudPct;
+}
+
 /// A processed image ready to overlay on the map.
 class ImageryOverlay {
   const ImageryOverlay({
@@ -47,12 +72,18 @@ class ImageryOverlay {
     required this.bounds,
     required this.scene,
     required this.analysis,
+    this.sceneB,
+    this.stats,
   });
 
   final Uint8List imageBytes;
   final LatLngBounds bounds;
   final SceneInfo scene;
   final String analysis;
+  final SceneInfo? sceneB;
+
+  /// For ndvi: that date's stats. For ndvi_compare: ΔNDVI stats.
+  final SceneStats? stats;
 }
 
 class ProcessingException implements Exception {
@@ -125,15 +156,20 @@ class ProcessingService {
     ];
   }
 
-  /// True-colour imagery for one scene, cropped to the area.
-  Future<ImageryOverlay> fetchTruecolor({
+  /// Runs an analysis for one scene (or two for ndvi_compare), cropped to
+  /// the area. [analysis] is 'truecolor', 'ndvi' or 'ndvi_compare'; for the
+  /// latter [sceneIdB] is the later date and the image shows ΔNDVI = B − A.
+  Future<ImageryOverlay> fetchAnalysis({
     required String polygonGeoJson,
     required String sceneId,
+    required String analysis,
+    String? sceneIdB,
   }) async {
     final body = await _post('/process', {
       'polygon': jsonDecode(polygonGeoJson),
-      'analysis': 'truecolor',
+      'analysis': analysis,
       'scene_id': sceneId,
+      if (sceneIdB != null) 'scene_id_b': sceneIdB,
     });
     final bounds = (body['bounds'] as List).cast<num>();
     return ImageryOverlay(
@@ -144,6 +180,12 @@ class ProcessingService {
       ),
       scene: SceneInfo.fromJson(body['scene'] as Map<String, dynamic>),
       analysis: body['analysis'] as String,
+      sceneB: body['scene_b'] == null
+          ? null
+          : SceneInfo.fromJson(body['scene_b'] as Map<String, dynamic>),
+      stats: body['stats'] == null
+          ? null
+          : SceneStats.fromJson(body['stats'] as Map<String, dynamic>),
     );
   }
 }

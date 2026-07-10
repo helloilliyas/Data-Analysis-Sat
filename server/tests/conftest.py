@@ -15,29 +15,59 @@ def utm_center():
     return to_utm.transform(CENTER_LON, CENTER_LAT)
 
 
-@pytest.fixture(scope="session")
-def synthetic_tci(tmp_path_factory, utm_center):
-    """A 3-band uint8 GeoTIFF (2 km × 2 km at 10 m) mimicking a TCI asset."""
-    cx, cy = utm_center
-    size, res = 200, 10
+def _write_tif(path, data, res):
+    """Writes bands centered on the test point at the given resolution."""
+    size = data.shape[-1]
+    # Recompute origin per resolution so 10 m and 20 m rasters cover the
+    # same ground extent, like real Sentinel-2 bands.
+    cx, cy = Transformer.from_crs("EPSG:4326", UTM, always_xy=True).transform(
+        CENTER_LON, CENTER_LAT
+    )
     transform = from_origin(cx - size / 2 * res, cy + size / 2 * res, res, res)
-    data = np.zeros((3, size, size), dtype=np.uint8)
-    data[0], data[1], data[2] = 60, 120, 40  # a flat green field
-
-    path = tmp_path_factory.mktemp("scenes") / "tci.tif"
+    count = data.shape[0] if data.ndim == 3 else 1
     with rasterio.open(
         path,
         "w",
         driver="GTiff",
         width=size,
         height=size,
-        count=3,
-        dtype="uint8",
+        count=count,
+        dtype=data.dtype.name,
         crs=UTM,
         transform=transform,
     ) as dst:
-        dst.write(data)
+        dst.write(data if data.ndim == 3 else data[np.newaxis])
     return str(path)
+
+
+@pytest.fixture(scope="session")
+def synthetic_tci(tmp_path_factory):
+    """A 3-band uint8 GeoTIFF (2 km × 2 km at 10 m) mimicking a TCI asset."""
+    data = np.zeros((3, 200, 200), dtype=np.uint8)
+    data[0], data[1], data[2] = 60, 120, 40  # a flat green field
+    return _write_tif(tmp_path_factory.mktemp("scenes") / "tci.tif", data, 10)
+
+
+@pytest.fixture(scope="session")
+def synthetic_bands(tmp_path_factory):
+    """red/nir/scl assets over the same 2 km extent.
+
+    DNs include the +1000 BOA offset: red 0.04, nir 0.44 reflectance →
+    NDVI ≈ (0.44-0.04)/(0.44+0.04) = 0.8333. The SCL marks the northern
+    quarter as cloud (class 9).
+    """
+    directory = tmp_path_factory.mktemp("bands")
+    red = np.full((200, 200), 1400, dtype=np.uint16)  # (1400-1000)/1e4
+    nir = np.full((200, 200), 5400, dtype=np.uint16)  # (5400-1000)/1e4
+    scl = np.full((100, 100), 4, dtype=np.uint8)  # vegetation
+    # Cloud (class 9) over the northern 40 rows (+1000 m … +200 m from the
+    # center) so it overlaps the test triangle's northern apex (~+333 m).
+    scl[:40, :] = 9
+    return {
+        "red": _write_tif(directory / "red.tif", red, 10),
+        "nir": _write_tif(directory / "nir.tif", nir, 10),
+        "scl": _write_tif(directory / "scl.tif", scl, 20),
+    }
 
 
 @pytest.fixture()

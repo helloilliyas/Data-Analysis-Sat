@@ -12,17 +12,27 @@ class FakeAsset:
 
 
 class FakeItem:
-    def __init__(self, item_id, cloud, href=None, date="2026-06-15T10:30:00Z"):
+    def __init__(self, item_id, cloud, href=None, date="2026-06-15T10:30:00Z",
+                 bands=None):
         self.id = item_id
-        self.properties = {"datetime": date, "eo:cloud_cover": cloud}
+        self.properties = {
+            "datetime": date,
+            "eo:cloud_cover": cloud,
+            "earthsearch:boa_offset_applied": False,
+            "s2:processing_baseline": "05.11",
+        }
         self.assets = {"visual": FakeAsset(href)} if href else {}
+        for name, band_href in (bands or {}).items():
+            self.assets[name] = FakeAsset(band_href)
 
 
 @pytest.fixture()
-def client(monkeypatch, synthetic_tci):
+def client(monkeypatch, synthetic_tci, synthetic_bands):
     scenes = [
-        FakeItem("S2A_TEST_1", 42.0, synthetic_tci, "2026-06-20T10:30:00Z"),
-        FakeItem("S2B_TEST_2", 7.5, synthetic_tci, "2026-06-15T10:30:00Z"),
+        FakeItem("S2A_TEST_1", 42.0, synthetic_tci, "2026-06-20T10:30:00Z",
+                 bands=synthetic_bands),
+        FakeItem("S2B_TEST_2", 7.5, synthetic_tci, "2026-06-15T10:30:00Z",
+                 bands=synthetic_bands),
     ]
     monkeypatch.setattr(stac, "search_scenes", lambda *a, **k: scenes)
     monkeypatch.setattr(
@@ -96,7 +106,7 @@ def test_process_unknown_scene(client, small_triangle):
     assert response.status_code == 404
 
 
-def test_ndvi_not_yet_implemented(client, small_triangle):
+def test_process_ndvi(client, small_triangle):
     response = client.post(
         "/process",
         json={
@@ -105,7 +115,46 @@ def test_ndvi_not_yet_implemented(client, small_triangle):
             "scene_id": "S2B_TEST_2",
         },
     )
-    assert response.status_code == 501
+    assert response.status_code == 200
+    body = response.json()
+    assert body["analysis"] == "ndvi"
+    assert 0.8 < body["stats"]["mean"] < 0.87
+    assert body["stats"]["aoi_cloud_pct"] > 0
+    assert len(base64.b64decode(body["image_b64"])) > 100
+    assert len(base64.b64decode(body["values_png16_b64"])) > 100
+
+
+def test_process_ndvi_compare(client, small_triangle):
+    response = client.post(
+        "/process",
+        json={
+            "polygon": small_triangle,
+            "analysis": "ndvi_compare",
+            "scene_id": "S2B_TEST_2",
+            "scene_id_b": "S2A_TEST_1",
+        },
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["scene"]["id"] == "S2B_TEST_2"
+    assert body["scene_b"]["id"] == "S2A_TEST_1"
+    # Identical synthetic dates → ΔNDVI ≈ 0.
+    assert abs(body["stats"]["mean"]) < 0.01
+    assert body["stats_a"]["mean"] == pytest.approx(
+        body["stats_b"]["mean"], abs=0.001
+    )
+
+
+def test_ndvi_compare_requires_second_scene(client, small_triangle):
+    response = client.post(
+        "/process",
+        json={
+            "polygon": small_triangle,
+            "analysis": "ndvi_compare",
+            "scene_id": "S2B_TEST_2",
+        },
+    )
+    assert response.status_code == 400
 
 
 def test_api_key_enforced(monkeypatch, client, small_triangle):

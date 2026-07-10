@@ -7,6 +7,7 @@ import '../db/database.dart';
 import '../services/geocoding_service.dart';
 import '../services/location_service.dart';
 import '../services/processing_service.dart';
+import '../services/trails_service.dart';
 import '../utils/geo.dart';
 import '../widgets/server_settings_dialog.dart';
 
@@ -38,6 +39,8 @@ class _MapScreenState extends State<MapScreen> {
   ImageryOverlay? _overlay;
   double _overlayOpacity = 1;
   bool _loadingImagery = false;
+  List<Trail>? _trails;
+  bool _loadingTrails = false;
 
   static const _initialCenter = LatLng(20.0, 0.0);
   static const _initialZoom = 2.5;
@@ -140,19 +143,21 @@ class _MapScreenState extends State<MapScreen> {
 
     final service = ProcessingService(config);
     final polygonGeoJson = polygonToGeoJson(_vertices);
-    final scene = await showModalBottomSheet<SceneInfo>(
+    final choice = await showModalBottomSheet<_ImageryChoice>(
       context: context,
       isScrollControlled: true,
       builder: (context) =>
           _ImagerySheet(service: service, polygonGeoJson: polygonGeoJson),
     );
-    if (scene == null || !mounted) return;
+    if (choice == null || !mounted) return;
 
     setState(() => _loadingImagery = true);
     try {
-      final overlay = await service.fetchTruecolor(
+      final overlay = await service.fetchAnalysis(
         polygonGeoJson: polygonGeoJson,
-        sceneId: scene.id,
+        sceneId: choice.sceneA.id,
+        analysis: choice.analysis,
+        sceneIdB: choice.sceneB?.id,
       );
       if (!mounted) return;
       setState(() => _overlay = overlay);
@@ -162,6 +167,39 @@ class _MapScreenState extends State<MapScreen> {
       if (mounted) setState(() => _loadingImagery = false);
     }
   }
+
+  Future<void> _toggleTrails() async {
+    if (_trails != null) {
+      setState(() => _trails = null);
+      return;
+    }
+    // Prefer the drawn area; fall back to the visible map region.
+    final bounds = _vertices.length >= 3
+        ? LatLngBounds.fromPoints(_vertices)
+        : _mapController.camera.visibleBounds;
+
+    setState(() => _loadingTrails = true);
+    try {
+      final trails = await TrailsService().fetchTrails(bounds);
+      if (!mounted) return;
+      setState(() => _trails = trails);
+      _showMessage(trails.isEmpty
+          ? 'No mapped paths or tracks here (per OpenStreetMap).'
+          : '${trails.length} paths/tracks found.');
+    } on TrailsException catch (e) {
+      _showMessage(e.message);
+    } finally {
+      if (mounted) setState(() => _loadingTrails = false);
+    }
+  }
+
+  static Color _trailColor(String type) => switch (type) {
+        'track' => Colors.brown,
+        'cycleway' => Colors.blue,
+        'bridleway' => Colors.deepPurple,
+        'steps' => Colors.redAccent,
+        _ => const Color(0xFF1B5E20), // path, footway
+      };
 
   Future<void> _openSearch() async {
     final result = await showDialog<PlaceResult>(
@@ -241,6 +279,18 @@ class _MapScreenState extends State<MapScreen> {
             tooltip: 'Satellite imagery',
             onPressed: _loadingImagery ? null : _openImagery,
           ),
+          IconButton(
+            icon: _loadingTrails
+                ? const SizedBox(
+                    width: 18,
+                    height: 18,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  )
+                : Icon(_trails == null ? Icons.route : Icons.route_outlined),
+            tooltip:
+                _trails == null ? 'Show paths & trails' : 'Hide paths & trails',
+            onPressed: _loadingTrails ? null : _toggleTrails,
+          ),
         ],
       ),
       body: Stack(
@@ -285,6 +335,15 @@ class _MapScreenState extends State<MapScreen> {
                       points: _vertices,
                       color: Colors.green,
                       strokeWidth: 2),
+                ]),
+              if (_trails != null && _trails!.isNotEmpty)
+                PolylineLayer(polylines: [
+                  for (final trail in _trails!)
+                    Polyline(
+                      points: trail.points,
+                      color: _trailColor(trail.type),
+                      strokeWidth: 3,
+                    ),
                 ]),
               MarkerLayer(markers: [
                 for (var i = 0; i < _vertices.length; i++)
@@ -500,6 +559,32 @@ class _OverlayControlCard extends StatelessWidget {
   final ValueChanged<double> onOpacityChanged;
   final VoidCallback onClose;
 
+  String get _label {
+    final stats = overlay.stats;
+    switch (overlay.analysis) {
+      case 'ndvi':
+        final mean = stats?.mean;
+        return 'NDVI ${overlay.scene.dateLabel}'
+            '${mean != null ? ' · mean ${mean.toStringAsFixed(2)}' : ''}'
+            '${stats != null ? ' · ${stats.aoiCloudPct.toStringAsFixed(0)}% cloud' : ''}';
+      case 'ndvi_compare':
+        final mean = stats?.mean;
+        final sign = (mean ?? 0) >= 0 ? '+' : '';
+        return 'ΔNDVI ${overlay.scene.dateLabel} → '
+            '${overlay.sceneB?.dateLabel ?? '?'}'
+            '${mean != null ? ' · $sign${mean.toStringAsFixed(2)}' : ''}';
+      default:
+        return '${overlay.scene.dateLabel} · '
+            '${overlay.scene.cloudPct.toStringAsFixed(0)}% cloud';
+    }
+  }
+
+  IconData get _icon => switch (overlay.analysis) {
+        'ndvi' => Icons.grass,
+        'ndvi_compare' => Icons.compare,
+        _ => Icons.satellite_alt,
+      };
+
   @override
   Widget build(BuildContext context) {
     return Card(
@@ -507,12 +592,11 @@ class _OverlayControlCard extends StatelessWidget {
         padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
         child: Row(
           children: [
-            const Icon(Icons.satellite_alt, size: 18),
+            Icon(_icon, size: 18),
             const SizedBox(width: 8),
             Expanded(
               child: Text(
-                '${overlay.scene.dateLabel} · '
-                '${overlay.scene.cloudPct.toStringAsFixed(0)}% cloud',
+                _label,
                 style: const TextStyle(fontSize: 13),
                 overflow: TextOverflow.ellipsis,
               ),
@@ -536,8 +620,21 @@ class _OverlayControlCard extends StatelessWidget {
   }
 }
 
+/// What the user picked in the imagery sheet.
+class _ImageryChoice {
+  const _ImageryChoice({
+    required this.analysis,
+    required this.sceneA,
+    this.sceneB,
+  });
+
+  final String analysis; // truecolor | ndvi | ndvi_compare
+  final SceneInfo sceneA;
+  final SceneInfo? sceneB;
+}
+
 /// Bottom sheet listing available Sentinel-2 scenes for the drawn area.
-/// Pops with the selected [SceneInfo].
+/// Pops with an [_ImageryChoice].
 class _ImagerySheet extends StatefulWidget {
   const _ImagerySheet({required this.service, required this.polygonGeoJson});
 
@@ -552,6 +649,8 @@ class _ImagerySheetState extends State<_ImagerySheet> {
   late DateTimeRange _range;
   List<SceneInfo>? _scenes;
   String? _error;
+  String _analysis = 'truecolor';
+  SceneInfo? _compareFirst;
 
   @override
   void initState() {
@@ -597,6 +696,35 @@ class _ImagerySheetState extends State<_ImagerySheet> {
       '${d.year}-${d.month.toString().padLeft(2, '0')}-'
       '${d.day.toString().padLeft(2, '0')}';
 
+  void _onSceneTap(SceneInfo scene) {
+    if (_analysis != 'ndvi_compare') {
+      Navigator.of(context)
+          .pop(_ImageryChoice(analysis: _analysis, sceneA: scene));
+      return;
+    }
+    final first = _compareFirst;
+    if (first == null || first.id == scene.id) {
+      setState(() => _compareFirst = first == null ? scene : null);
+      return;
+    }
+    // Server computes Δ = B − A, so order by date: A earlier, B later.
+    final aFirst = first.dateTime.isBefore(scene.dateTime);
+    Navigator.of(context).pop(_ImageryChoice(
+      analysis: 'ndvi_compare',
+      sceneA: aFirst ? first : scene,
+      sceneB: aFirst ? scene : first,
+    ));
+  }
+
+  String get _hint => switch (_analysis) {
+        'ndvi_compare' => _compareFirst == null
+            ? 'Pick the first of two dates to compare.'
+            : 'Now pick the second date.',
+        'ndvi' =>
+          'Vegetation index — clouds are masked out automatically.',
+        _ => 'Cloud % is for the whole scene — your area may differ.',
+      };
+
   @override
   Widget build(BuildContext context) {
     final scenes = _scenes;
@@ -621,9 +749,33 @@ class _ImagerySheetState extends State<_ImagerySheet> {
                 ),
               ],
             ),
-            const Text(
-              'Cloud % is for the whole scene — your area may differ.',
-              style: TextStyle(fontSize: 12, color: Colors.grey),
+            Center(
+              child: SegmentedButton<String>(
+                segments: const [
+                  ButtonSegment(
+                      value: 'truecolor',
+                      icon: Icon(Icons.photo),
+                      label: Text('Photo')),
+                  ButtonSegment(
+                      value: 'ndvi',
+                      icon: Icon(Icons.grass),
+                      label: Text('NDVI')),
+                  ButtonSegment(
+                      value: 'ndvi_compare',
+                      icon: Icon(Icons.compare),
+                      label: Text('Compare')),
+                ],
+                selected: {_analysis},
+                onSelectionChanged: (s) => setState(() {
+                  _analysis = s.first;
+                  _compareFirst = null;
+                }),
+              ),
+            ),
+            const SizedBox(height: 4),
+            Text(
+              _hint,
+              style: const TextStyle(fontSize: 12, color: Colors.grey),
             ),
             const SizedBox(height: 8),
             if (_error != null)
@@ -652,18 +804,28 @@ class _ImagerySheetState extends State<_ImagerySheet> {
                   itemBuilder: (context, i) {
                     final scene = scenes[i];
                     final cloudy = scene.cloudPct > 40;
+                    final isFirstPick = _compareFirst?.id == scene.id;
                     return ListTile(
                       dense: true,
+                      selected: isFirstPick,
                       leading: Icon(
-                        cloudy ? Icons.cloud : Icons.wb_sunny,
-                        color: cloudy ? Colors.grey : Colors.orange,
+                        isFirstPick
+                            ? Icons.looks_one
+                            : cloudy
+                                ? Icons.cloud
+                                : Icons.wb_sunny,
+                        color: isFirstPick
+                            ? Theme.of(context).colorScheme.primary
+                            : cloudy
+                                ? Colors.grey
+                                : Colors.orange,
                       ),
                       title: Text(scene.dateLabel),
                       subtitle: Text(
                           '${scene.cloudPct.toStringAsFixed(0)}% cloud · ${scene.id}',
                           maxLines: 1,
                           overflow: TextOverflow.ellipsis),
-                      onTap: () => Navigator.of(context).pop(scene),
+                      onTap: () => _onSceneTap(scene),
                     );
                   },
                 ),

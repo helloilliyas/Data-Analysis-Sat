@@ -50,6 +50,47 @@ def create_app() -> FastAPI:
         )
         return DatesResponse(scenes=[_scene_info(i) for i in items])
 
+    def _resolve_scene(request: ProcessRequest):
+        if request.scene_id:
+            item = stac.get_scene(request.scene_id)
+            if item is None:
+                raise HTTPException(status_code=404, detail="scene not found")
+            return item
+        if not request.date_range:
+            raise HTTPException(
+                status_code=400, detail="provide scene_id or date_range"
+            )
+        items = stac.search_scenes(
+            request.polygon, request.date_range, request.max_cloud
+        )
+        if not items:
+            raise HTTPException(
+                status_code=404,
+                detail="no scenes match the area, dates and cloud limit",
+            )
+        return min(items, key=lambda i: i.properties.get("eo:cloud_cover", 101))
+
+    def _band_hrefs(item) -> tuple[str, str, str | None]:
+        red = item.assets.get("red")
+        nir = item.assets.get("nir")
+        scl = item.assets.get("scl")
+        if red is None or nir is None:
+            raise HTTPException(
+                status_code=502, detail="scene is missing red/nir bands"
+            )
+        return red.href, nir.href, scl.href if scl else None
+
+    def _ndvi_for(item, polygon, grid=None) -> processing.NdviResult:
+        red, nir, scl = _band_hrefs(item)
+        return processing.compute_ndvi(
+            red,
+            nir,
+            scl,
+            polygon,
+            apply_offset=processing.needs_boa_offset(item.properties),
+            grid=grid,
+        )
+
     @app.post("/process", dependencies=[Depends(_require_api_key)])
     def process(request: ProcessRequest) -> ProcessResponse:
         try:
@@ -57,51 +98,61 @@ def create_app() -> FastAPI:
         except processing.ProcessingError as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
 
-        if request.analysis != "truecolor":
-            raise HTTPException(
-                status_code=501,
-                detail=f"analysis '{request.analysis}' arrives in Phase 3",
-            )
-
-        if request.scene_id:
-            item = stac.get_scene(request.scene_id)
-            if item is None:
-                raise HTTPException(status_code=404, detail="scene not found")
-        else:
-            if not request.date_range:
-                raise HTTPException(
-                    status_code=400, detail="provide scene_id or date_range"
-                )
-            items = stac.search_scenes(
-                request.polygon, request.date_range, request.max_cloud
-            )
-            if not items:
-                raise HTTPException(
-                    status_code=404,
-                    detail="no scenes match the area, dates and cloud limit",
-                )
-            item = min(
-                items, key=lambda i: i.properties.get("eo:cloud_cover", 101)
-            )
-
-        visual = item.assets.get("visual")
-        if visual is None:
-            raise HTTPException(
-                status_code=502, detail="scene has no true-colour asset"
-            )
+        item = _resolve_scene(request)
 
         try:
-            image_b64, bounds = processing.render_truecolor(
-                visual.href, request.polygon
+            if request.analysis == "truecolor":
+                visual = item.assets.get("visual")
+                if visual is None:
+                    raise HTTPException(
+                        status_code=502, detail="scene has no true-colour asset"
+                    )
+                image_b64, bounds = processing.render_truecolor(
+                    visual.href, request.polygon
+                )
+                return ProcessResponse(
+                    scene=_scene_info(item),
+                    analysis=request.analysis,
+                    image_b64=image_b64,
+                    bounds=bounds,
+                )
+
+            if request.analysis == "ndvi":
+                result = _ndvi_for(item, request.polygon)
+                return ProcessResponse(
+                    scene=_scene_info(item),
+                    analysis=request.analysis,
+                    image_b64=processing.render_ndvi(result),
+                    bounds=processing.bounds_wgs84(result.grid),
+                    stats=result.stats(),
+                    values_png16_b64=processing.encode_values_png16(result),
+                )
+
+            # ndvi_compare: A = request.scene_id (earlier), B = scene_id_b.
+            if not request.scene_id_b:
+                raise HTTPException(
+                    status_code=400,
+                    detail="ndvi_compare needs scene_id and scene_id_b",
+                )
+            item_b = stac.get_scene(request.scene_id_b)
+            if item_b is None:
+                raise HTTPException(status_code=404, detail="scene_b not found")
+
+            result_a = _ndvi_for(item, request.polygon)
+            result_b = _ndvi_for(item_b, request.polygon, grid=result_a.grid)
+            image_b64, delta = processing.render_delta(result_a, result_b)
+            return ProcessResponse(
+                scene=_scene_info(item),
+                scene_b=_scene_info(item_b),
+                analysis=request.analysis,
+                image_b64=image_b64,
+                bounds=processing.bounds_wgs84(delta.grid),
+                stats=delta.stats(),
+                stats_a=result_a.stats(),
+                stats_b=result_b.stats(),
+                values_png16_b64=processing.encode_values_png16(delta),
             )
         except processing.ProcessingError as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
-
-        return ProcessResponse(
-            scene=_scene_info(item),
-            analysis=request.analysis,
-            image_b64=image_b64,
-            bounds=bounds,
-        )
 
     return app

@@ -73,9 +73,10 @@ void main() {
     });
 
     final overlay =
-        await ProcessingService(config, client: client).fetchTruecolor(
+        await ProcessingService(config, client: client).fetchAnalysis(
       polygonGeoJson: _polygon,
       sceneId: 'S2B_TEST',
+      analysis: 'truecolor',
     );
 
     expect(overlay.imageBytes, [1, 2, 3, 4]);
@@ -84,6 +85,56 @@ void main() {
     expect(overlay.bounds.northEast.longitude, 5.70);
     expect(overlay.bounds.northEast.latitude, 52.53);
     expect(overlay.scene.id, 'S2B_TEST');
+  });
+
+  test('fetchAnalysis parses NDVI compare with stats', () async {
+    final client = MockClient((request) async {
+      final body = jsonDecode(request.body) as Map<String, dynamic>;
+      expect(body['analysis'], 'ndvi_compare');
+      expect(body['scene_id'], 'S2_A');
+      expect(body['scene_id_b'], 'S2_B');
+      return http.Response(
+        jsonEncode({
+          'scene': {
+            'id': 'S2_A',
+            'datetime': '2026-05-01T10:30:00Z',
+            'cloud_pct': 5.0,
+          },
+          'scene_b': {
+            'id': 'S2_B',
+            'datetime': '2026-06-15T10:30:00Z',
+            'cloud_pct': 8.0,
+          },
+          'analysis': 'ndvi_compare',
+          'image_b64': base64Encode([9, 9]),
+          'bounds': [5.66, 52.51, 5.70, 52.53],
+          'stats': {
+            'mean': -0.12,
+            'min': -0.6,
+            'max': 0.2,
+            'valid_pixel_pct': 91.5,
+            'aoi_cloud_pct': 4.0,
+            'histogram': [1, 2, 3],
+          },
+        }),
+        200,
+        headers: {'content-type': 'application/json'},
+      );
+    });
+
+    final overlay =
+        await ProcessingService(config, client: client).fetchAnalysis(
+      polygonGeoJson: _polygon,
+      sceneId: 'S2_A',
+      analysis: 'ndvi_compare',
+      sceneIdB: 'S2_B',
+    );
+
+    expect(overlay.analysis, 'ndvi_compare');
+    expect(overlay.sceneB!.id, 'S2_B');
+    expect(overlay.stats!.mean, -0.12);
+    expect(overlay.stats!.validPixelPct, 91.5);
+    expect(overlay.stats!.aoiCloudPct, 4.0);
   });
 
   test('server error surfaces the detail message', () async {
