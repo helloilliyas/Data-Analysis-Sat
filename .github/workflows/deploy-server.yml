@@ -1,0 +1,50 @@
+name: Deploy server
+
+# Deploys the FastAPI processing service to Modal from GitHub's runners, so
+# no laptop is needed. Requires three repository secrets (Settings → Secrets
+# and variables → Actions):
+#   MODAL_TOKEN_ID       from modal.com → Settings → API Tokens
+#   MODAL_TOKEN_SECRET   shown together with the token ID
+#   PROCESSING_API_KEY   any long random string you invent — enter the same
+#                        value in the app's Settings dialog
+on:
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: server
+    env:
+      MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+      MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Check secrets are configured
+        env:
+          PROCESSING_API_KEY: ${{ secrets.PROCESSING_API_KEY }}
+        run: |
+          missing=""
+          [ -z "$MODAL_TOKEN_ID" ] && missing="$missing MODAL_TOKEN_ID"
+          [ -z "$MODAL_TOKEN_SECRET" ] && missing="$missing MODAL_TOKEN_SECRET"
+          [ -z "$PROCESSING_API_KEY" ] && missing="$missing PROCESSING_API_KEY"
+          if [ -n "$missing" ]; then
+            echo "::error::Missing repository secret(s):$missing — add them in Settings → Secrets and variables → Actions"
+            exit 1
+          fi
+      - run: pip install modal
+      - name: Create/update the API key secret on Modal
+        env:
+          PROCESSING_API_KEY: ${{ secrets.PROCESSING_API_KEY }}
+        run: modal secret create satellite-api API_KEY="$PROCESSING_API_KEY" --force
+      - name: Deploy to Modal
+        run: modal deploy modal_app.py
+      - name: Show the server URL
+        run: |
+          echo "### Server deployed 🚀" >> "$GITHUB_STEP_SUMMARY"
+          echo "Look for the .modal.run URL in the 'Deploy to Modal' step above." >> "$GITHUB_STEP_SUMMARY"
+          echo "Enter it in the app: Settings → Server URL, plus your PROCESSING_API_KEY as the API key." >> "$GITHUB_STEP_SUMMARY"
